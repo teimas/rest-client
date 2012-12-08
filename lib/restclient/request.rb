@@ -23,13 +23,15 @@ module RestClient
   # * :timeout and :open_timeout passing in -1 will disable the timeout by setting the corresponding net timeout values to nil
   # * :ssl_client_cert, :ssl_client_key, :ssl_ca_file
   # * :ssl_verify_callback, :ssl_verify_callback_warnings
+  # * :ssl_version specifies the SSL version for the underlying Net::HTTP connection (defaults to 'SSLv3')
   class Request
 
     attr_reader :method, :url, :headers, :cookies,
                 :payload, :user, :password, :timeout, :max_redirects,
                 :open_timeout, :raw_response, :verify_ssl, :ssl_client_cert,
                 :ssl_client_key, :ssl_ca_file, :processed_headers, :args,
-                :ssl_verify_callback, :ssl_verify_callback_warnings
+                :ssl_verify_callback, :ssl_verify_callback_warnings,
+                :ssl_version
 
     def self.execute(args, & block)
       new(args).execute(& block)
@@ -57,6 +59,7 @@ module RestClient
       @ssl_ca_file = args[:ssl_ca_file] || nil
       @ssl_verify_callback = args[:ssl_verify_callback] || nil
       @ssl_verify_callback_warnings = args.fetch(:ssl_verify_callback, true)
+      @ssl_version = args[:ssl_version] || 'SSLv3'
       @tf = nil # If you are a raw request, this is your tempfile
       @max_redirects = args[:max_redirects] || 10
       @processed_headers = make_headers headers
@@ -159,14 +162,18 @@ module RestClient
 
       net = net_http_class.new(uri.host, uri.port)
       net.use_ssl = uri.is_a?(URI::HTTPS)
-      if @verify_ssl
-        if @verify_ssl.is_a? Integer
-          net.verify_mode = @verify_ssl
-        else
-          net.verify_mode = OpenSSL::SSL::VERIFY_PEER
-        end
-      else
+      net.ssl_version = @ssl_version
+      if (@verify_ssl == false) || (@verify_ssl == OpenSSL::SSL::VERIFY_NONE)
         net.verify_mode = OpenSSL::SSL::VERIFY_NONE
+      elsif @verify_ssl.is_a? Integer
+        net.verify_mode = @verify_ssl
+        net.verify_callback = lambda do |preverify_ok, ssl_context|
+          if (!preverify_ok) || ssl_context.error != 0
+            err_msg = "SSL Verification failed -- Preverify: #{preverify_ok}, Error: #{ssl_context.error_string} (#{ssl_context.error})"
+            raise SSLCertificateNotVerified.new(err_msg)
+          end
+          true
+        end
       end
       net.cert = @ssl_client_cert if @ssl_client_cert
       net.key = @ssl_client_key if @ssl_client_key
@@ -177,25 +184,6 @@ module RestClient
       # disable the timeout if the timeout value is -1
       net.read_timeout = nil if @timeout == -1
       net.open_timeout = nil if @open_timeout == -1
-
-      # verify_callback isn't well supported on all platforms, but do allow
-      # users to set one if they want.
-      if ssl_verify_callback
-        net.verify_callback = ssl_verify_callback
-
-        # Hilariously, jruby only calls the callback when cert_store is set to
-        # something, so make sure to set one.
-        # https://github.com/jruby/jruby/issues/597
-        if RestClient::Platform.jruby?
-          net.cert_store ||= OpenSSL::X509::Store.new
-        end
-
-        if ssl_verify_callback_warnings != false
-          if print_verify_callback_warnings
-            warn('pass :ssl_verify_callback_warnings => false to silence this')
-          end
-        end
-      end
 
       RestClient.before_execution_procs.each do |before_proc|
         before_proc.call(req, args)
@@ -216,11 +204,6 @@ module RestClient
       raise RestClient::ServerBrokeConnection
     rescue Timeout::Error
       raise RestClient::RequestTimeout
-    rescue OpenSSL::SSL::SSLError => error
-      # UGH. Not sure if this is needed at all. SSLCertificateNotVerified is not being used internally.
-      # I think it would be better to leave SSLError processing to the client (they'd have to do that anyway...)
-      raise SSLCertificateNotVerified.new(error.message) if error.message.include?("certificate verify failed")
-      raise error
     end
 
     def setup_credentials(req)
